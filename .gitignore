@@ -1,5 +1,6 @@
 data/
 .vscode
+.DS_Store/
 
 # Custom ML project exclusions
 lightning_logs/
