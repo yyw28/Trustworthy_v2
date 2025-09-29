@@ -1,0 +1,1 @@
+from project.model.model import ExampleModel
