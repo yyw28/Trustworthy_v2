@@ -22,6 +22,7 @@ dependencies = [
     "tensorboard==2.20.0",
     "torch==2.8.0",
     "pandas==2.3.2",
+    "torchaudio==2.8.0",
 ]
 
 [tool.setuptools.package-data]
