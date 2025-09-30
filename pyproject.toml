@@ -23,6 +23,7 @@ dependencies = [
     "torch==2.8.0",
     "pandas==2.3.2",
     "torchaudio==2.8.0",
+    "soundfile==0.13.1",
 ]
 
 [tool.setuptools.package-data]
