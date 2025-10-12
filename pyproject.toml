@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [tool.setuptools.package-data]
-"project" = ["py.typed"]
+"tspeech" = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -38,7 +38,7 @@ where = ["src"]
 "Bug Tracker" = "https://github.com/mattm458/ml-template/issues"
 
 [project.scripts]
-project = "project.main:cli_main"
+htmodel = "tspeech.htmodel:cli_main"
 
 [tool.pytest.ini_options]
 addopts = [
