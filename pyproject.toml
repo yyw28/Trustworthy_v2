@@ -21,6 +21,7 @@ dependencies = [
     "pytest==8.4.2",
     "tensorboard==2.20.0",
     "torch==2.8.0",
+    "transformers==4.57.0",
     "pandas==2.3.2",
     "torchaudio==2.8.0",
     "soundfile==0.13.1",
