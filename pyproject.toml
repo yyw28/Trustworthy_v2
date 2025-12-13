@@ -16,14 +16,16 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "jsonargparse[signatures]==4.41.0",
-    "lightning==2.5.5",
-    "pytest==8.4.2",
+    "jsonargparse[signatures]==4.44.0",
+    "lightning==2.6.0",
+    "matplotlib==3.10.8",
+    "pytest==9.0.2",
     "tensorboard==2.20.0",
-    "torch==2.8.0",
-    "transformers==4.57.0",
-    "pandas==2.3.2",
-    "torchaudio==2.8.0",
+    "torch==2.9.1",
+    "torchcodec==0.9.1",
+    "transformers==4.57.3",
+    "pandas==2.3.3",
+    "torchaudio==2.9.1",
     "soundfile==0.13.1",
 ]
 
