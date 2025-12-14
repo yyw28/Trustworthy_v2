@@ -32,7 +32,7 @@
     "optimizer": {
         "class_path": "Adam",
         "init_args": {
-            "lr": 1e-5,
+            "lr": 1e-4,
             "weight_decay": 1e-6
         }
     },
@@ -65,6 +65,6 @@
             }
         },
         "precision": "16-mixed",
-        "check_val_every_n_epoch": 150
+        "val_check_interval": 150
     }
 }
