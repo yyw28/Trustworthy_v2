@@ -17,7 +17,8 @@ classifiers = [
 ]
 dependencies = [
     "jsonargparse[signatures]==4.44.0",
-    "lightning==2.6.0",
+    "librosa==0.11.0",
+    "lightning==2.5.4",
     "matplotlib==3.10.8",
     "pytest==9.0.2",
     "tensorboard==2.20.0",
@@ -27,6 +28,7 @@ dependencies = [
     "pandas==2.3.3",
     "torchaudio==2.9.1",
     "soundfile==0.13.1",
+    "Unidecode==1.4.0"
 ]
 
 [tool.setuptools.package-data]
@@ -41,6 +43,7 @@ where = ["src"]
 
 [project.scripts]
 htmodel = "tspeech.htmodel:cli_main"
+tts = "tspeech.tts:cli_main"
 
 [tool.pytest.ini_options]
 addopts = [
