@@ -125,6 +125,7 @@ class Tacotron2(nn.Module):
         mel_spectrogram_len: Optional[Tensor] = None,
         speaker_id: Optional[Tensor] = None,
         max_len_override: Optional[int] = None,
+        encoded_extra: Optional[Tensor] = None,
     ):
         if teacher_forcing:
             assert (
@@ -146,6 +147,8 @@ class Tacotron2(nn.Module):
         encoded = self.encoder(chars_idx, chars_idx_len)
         if self.speaker_embeddings_enabled:
             encoded = encoded + self.speaker_embedding(speaker_id).unsqueeze(1)
+        if encoded_extra is not None:
+            encoded = encoded + encoded_extra
 
         # Create a mask for the encoded characters
         encoded_mask = (
