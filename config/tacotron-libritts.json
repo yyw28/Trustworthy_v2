@@ -1,0 +1,70 @@
+{
+    "data": {
+        "allowed_chars": "!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz",
+        "batch_size": 8,
+        "csv_test": "libritts-test.csv",
+        "csv_train": "libritts-train.csv",
+        "csv_val": "libritts-val.csv",
+        "end_token": "^",
+        "expand_abbreviations": true,
+        "num_mels": 80,
+        "num_workers": 4,
+        "sample_rate": 24000,
+        "silence": 0,
+        "trim": true,
+        "trim_frame_length": 1024,
+        "trim_top_db": 40
+    },
+    "model": {
+        "att_dim": 128,
+        "att_rnn_dim": 1024,
+        "num_chars": 39,
+        "dropout": 0.5,
+        "encoded_dim": 512,
+        "encoder_kernel_size": 5,
+        "num_mels": 80,
+        "postnet_dim": 512,
+        "prenet_dim": 256,
+        "rnn_hidden_dim": 1024,
+        "speaker_tokens_enabled": true,
+        "speaker_count": 928
+    },
+    "optimizer": {
+        "class_path": "Adam",
+        "init_args": {
+            "lr": 1e-4,
+            "weight_decay": 1e-6
+        }
+    },
+    "trainer": {
+        "callbacks": [
+            {
+                "class_path": "lightning.pytorch.callbacks.EarlyStopping",
+                "init_args": {
+                    "mode": "max",
+                    "monitor": "val_loss",
+                    "patience": 25
+                }
+            },
+            {
+                "class_path": "lightning.pytorch.callbacks.ModelCheckpoint",
+                "init_args": {
+                    "filename": "checkpoint-{epoch}-{val_loss:.5f}",
+                    "mode": "max",
+                    "monitor": "val_loss",
+                    "save_top_k": 1
+                }
+            }
+        ],
+        "logger": {
+            "class_path": "lightning.pytorch.loggers.TensorBoardLogger",
+            "init_args": {
+                "default_hp_metric": false,
+                "name": "tacotron2",
+                "save_dir": "lightning_logs"
+            }
+        },
+        "precision": "16-mixed",
+        "val_check_interval": 150
+    }
+}
