@@ -93,7 +93,7 @@ class TTSModel(pl.LightningModule):
         mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
 
         loss = gate_loss + mel_loss + mel_post_loss
-        self.log("val_mel_loss", loss, on_step=False, on_epoch=True)
+        self.log("val_mel_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
 
         mel_spectrogram_len = batch.mel_spectrogram_len
         chars_idx_len = batch.chars_idx_len
@@ -109,7 +109,7 @@ class TTSModel(pl.LightningModule):
             "gate_pred": gate[0],
         }
 
-        self.log("val_loss", loss, on_step=False, on_epoch=True)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
 
         out["loss"] = loss
         return out
@@ -135,6 +135,7 @@ class TTSModel(pl.LightningModule):
             gate_loss.detach(),
             on_step=True,
             on_epoch=True,
+            sync_dist=True,
         )
         self.log("training_mel_loss", mel_loss.detach(), on_step=True, on_epoch=True)
         self.log(
@@ -142,12 +143,10 @@ class TTSModel(pl.LightningModule):
             mel_post_loss.detach(),
             on_step=True,
             on_epoch=True,
+            sync_dist=True,
         )
         self.log(
-            "training_loss",
-            loss.detach(),
-            on_step=True,
-            on_epoch=True,
+            "training_loss", loss.detach(), on_step=True, on_epoch=True, sync_dist=True
         )
 
         return loss
