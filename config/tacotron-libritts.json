@@ -1,7 +1,7 @@
 {
     "data": {
         "allowed_chars": "!'(),.:;? \\-abcdefghijklmnopqrstuvwxyz",
-        "batch_size": 8,
+        "batch_size": 25,
         "csv_test": "libritts-test.csv",
         "csv_train": "libritts-train.csv",
         "csv_val": "libritts-val.csv",
@@ -41,7 +41,7 @@
             {
                 "class_path": "lightning.pytorch.callbacks.EarlyStopping",
                 "init_args": {
-                    "mode": "max",
+                    "mode": "min",
                     "monitor": "val_loss",
                     "patience": 25
                 }
