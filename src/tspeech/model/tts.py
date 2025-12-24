@@ -12,6 +12,9 @@ from torch.nn import functional as F
 from tspeech.data.tts import TTSBatch
 from tspeech.model.tacotron2 import Tacotron2
 from tspeech.model.tacotron2 import GST
+from tspeech.model.tacotron2.bert_gst_encoder import BERTGSTEncoder
+from tspeech.model.tacotron2.gst_with_weights import GSTWithWeights
+from tspeech.model.tacotron2.rl_gst_policy import RLGSTPolicy, RLGSTRewardFunction
 
 
 class TTSModel(pl.LightningModule):
@@ -30,6 +33,15 @@ class TTSModel(pl.LightningModule):
         speaker_tokens_enabled: bool = False,
         speaker_count: int = 1,
         max_len_override: Optional[int] = None,
+        use_bert_gst: bool = True,
+        bert_model_name: str = "bert-base-uncased",
+        freeze_bert: bool = True,
+        use_hubert_classifier: bool = True,
+        hubert_model_name: str = "facebook/hubert-base-ls960",
+        hubert_checkpoint_path: Optional[str] = None,
+        use_rl_training: bool = False,
+        rl_temperature: float = 1.0,
+        rl_entropy_coef: float = 0.01,
     ):
         super().__init__()
 
@@ -37,6 +49,10 @@ class TTSModel(pl.LightningModule):
 
         self.speaker_tokens = speaker_tokens_enabled
         self.max_len_override = max_len_override
+        self.use_bert_gst = use_bert_gst
+        self.use_hubert_classifier = use_hubert_classifier
+        self.use_rl_training = use_rl_training
+        self.rl_entropy_coef = rl_entropy_coef
 
         self.tacotron2 = Tacotron2(
             num_chars=num_chars,
@@ -53,7 +69,58 @@ class TTSModel(pl.LightningModule):
             speaker_count=speaker_count,
         )
 
-        self.gst = GST(out_dim=encoded_dim)
+        # BERT-based GST encoder (replaces mel-based GST)
+        if use_bert_gst:
+            self.bert_gst_encoder = BERTGSTEncoder(
+                bert_model_name=bert_model_name,
+                gst_token_num=10,
+                freeze_bert=freeze_bert,
+            )
+            self.gst_with_weights = GSTWithWeights(
+                token_num=10,
+                token_embedding_size=encoded_dim,
+            )
+            
+            # RL Policy network for GST weights optimization
+            if use_rl_training:
+                bert_hidden_size = self.bert_gst_encoder.bert.config.hidden_size
+                self.rl_policy = RLGSTPolicy(
+                    bert_hidden_size=bert_hidden_size,
+                    gst_token_num=10,
+                    temperature=rl_temperature,
+                )
+                self.reward_function = RLGSTRewardFunction(
+                    trustworthiness_weight=1.0,
+                    use_baseline=True,
+                )
+        else:
+            # Fallback to original mel-based GST
+            self.gst = GST(out_dim=encoded_dim)
+        
+        # HubERT trustworthiness classifier
+        if use_hubert_classifier:
+            from tspeech.hubert.model.htmodel import HTModel
+            
+            # Load HubERT model (can be pretrained checkpoint or fresh)
+            if hubert_checkpoint_path:
+                # Load from checkpoint
+                self.hubert_classifier = HTModel.load_from_checkpoint(
+                    hubert_checkpoint_path,
+                    hubert_model_name=hubert_model_name,
+                    trainable_layers=0,  # Use frozen for inference
+                )
+                # Freeze for inference
+                for param in self.hubert_classifier.parameters():
+                    param.requires_grad = False
+            else:
+                # Create new model (will need to be trained separately)
+                self.hubert_classifier = HTModel(
+                    hubert_model_name=hubert_model_name,
+                    trainable_layers=0,
+                )
+                # Freeze for inference
+                for param in self.hubert_classifier.parameters():
+                    param.requires_grad = False
 
     def forward(
         self,
@@ -64,10 +131,52 @@ class TTSModel(pl.LightningModule):
         mel_spectrogram_len: Optional[Tensor] = None,
         speaker_id: Optional[Tensor] = None,
         max_len_override: Optional[int] = None,
+        text: Optional[List[str]] = None,
+        return_trustworthiness: bool = False,
     ):
-        style = self.gst(mel_spectrogram, mel_spectrogram_len)
+        # Generate GST style embedding
+        if self.use_bert_gst:
+            # Use BERT to generate GST weights from text
+            if text is None:
+                raise ValueError("text is required when use_bert_gst=True")
+            
+            # Get GST weights (either from deterministic encoder or RL policy)
+            if self.use_rl_training and self.training:
+                # Use RL policy during training
+                bert_embeddings = self.bert_gst_encoder.get_bert_embeddings(text)
+                gst_weights, log_probs, entropy = self.rl_policy(
+                    bert_embeddings,
+                    deterministic=False,
+                )
+                # Store for REINFORCE loss computation
+                self._rl_log_probs = log_probs
+                self._rl_entropy = entropy
+            else:
+                # Use deterministic BERT encoder (inference or non-RL training)
+                gst_weights = self.bert_gst_encoder(text)  # (batch, 10)
+                self._rl_log_probs = None
+                self._rl_entropy = None
+            
+            # Convert weights to style embedding
+            style = self.gst_with_weights(gst_weights)  # (batch, encoded_dim)
+            
+            # Style will be added to encoded in Tacotron2, which expects (batch, seq_len, encoded_dim)
+            # But Tacotron2 handles broadcasting, so we can pass (batch, encoded_dim)
+            # and it will be added correctly. However, let's expand it to be explicit.
+            batch_size = chars_idx.shape[0]
+            seq_len = chars_idx.shape[1]
+            style = style.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, encoded_dim)
+        else:
+            # Fallback to original mel-based GST
+            style = self.gst(mel_spectrogram, mel_spectrogram_len)  # (batch, encoded_dim)
+            # Expand to match sequence length
+            batch_size = chars_idx.shape[0]
+            seq_len = chars_idx.shape[1]
+            if style.dim() == 2:
+                style = style.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, encoded_dim)
 
-        return self.tacotron2(
+        # Forward through Tacotron2
+        mel_output, mel_postnet, gate, alignment = self.tacotron2(
             chars_idx=chars_idx,
             chars_idx_len=chars_idx_len,
             teacher_forcing=teacher_forcing,
@@ -77,6 +186,22 @@ class TTSModel(pl.LightningModule):
             max_len_override=max_len_override,
             encoded_extra=style,
         )
+        
+        # Evaluate trustworthiness with HubERT if requested
+        trustworthiness_score = None
+        if return_trustworthiness and self.use_hubert_classifier:
+            # Convert mel spectrogram to waveform for HubERT
+            # Note: This requires a vocoder. For now, we'll use mel directly
+            # In practice, you'd convert mel -> waveform using a vocoder (e.g., WaveGlow, HiFi-GAN)
+            # For HubERT, we need waveform input, but we can approximate or use mel features
+            
+            # HubERT expects waveform input, but we have mel spectrograms
+            # We'll need to convert mel -> waveform or adapt HubERT input
+            # For now, skip trustworthiness evaluation in forward pass
+            # It should be done separately after vocoder conversion
+            pass
+        
+        return mel_output, mel_postnet, gate, alignment
 
     def validation_step(self, batch: TTSBatch, batch_idx):
         mel_spectrogram, mel_spectrogram_post, gate, alignment = self(
@@ -86,6 +211,7 @@ class TTSModel(pl.LightningModule):
             speaker_id=batch.speaker_id,
             mel_spectrogram=batch.mel_spectrogram,
             mel_spectrogram_len=batch.mel_spectrogram_len,
+            text=batch.text,
         )
 
         gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
@@ -122,13 +248,33 @@ class TTSModel(pl.LightningModule):
             speaker_id=batch.speaker_id,
             mel_spectrogram=batch.mel_spectrogram,
             mel_spectrogram_len=batch.mel_spectrogram_len,
+            text=batch.text,
         )
 
+        # Standard TTS losses
         gate_loss = F.binary_cross_entropy_with_logits(gate, batch.gate)
         mel_loss = F.mse_loss(mel_spectrogram, batch.mel_spectrogram)
         mel_post_loss = F.mse_loss(mel_spectrogram_post, batch.mel_spectrogram)
-
-        loss = gate_loss + mel_loss + mel_post_loss
+        
+        tts_loss = gate_loss + mel_loss + mel_post_loss
+        
+        # RL loss (REINFORCE) if RL training is enabled
+        rl_loss = None
+        if self.use_rl_training and self._rl_log_probs is not None:
+            # Note: For RL training, we need to:
+            # 1. Generate waveform from mel spectrogram (requires vocoder)
+            # 2. Evaluate trustworthiness using HubERT
+            # 3. Compute REINFORCE loss
+            
+            # For now, we'll compute RL loss in a separate step after vocoder conversion
+            # This is a placeholder - in practice, you'd call this after vocoder
+            rl_loss = torch.tensor(0.0, device=tts_loss.device, requires_grad=True)
+        
+        # Total loss
+        if rl_loss is not None:
+            loss = tts_loss + rl_loss
+        else:
+            loss = tts_loss
 
         self.log(
             "training_gate_loss",
@@ -143,6 +289,13 @@ class TTSModel(pl.LightningModule):
             on_step=True,
             on_epoch=True,
         )
+        if rl_loss is not None:
+            self.log(
+                "training_rl_loss",
+                rl_loss.detach(),
+                on_step=True,
+                on_epoch=True,
+            )
         self.log(
             "training_loss",
             loss.detach(),
@@ -151,6 +304,96 @@ class TTSModel(pl.LightningModule):
         )
 
         return loss
+    
+    def compute_rl_loss(
+        self,
+        waveforms: Tensor,
+        sample_rate: int = 16000,
+    ) -> Tensor:
+        """
+        Compute REINFORCE loss for RL training.
+        
+        This should be called after generating waveforms from mel spectrograms
+        using a vocoder.
+        
+        Parameters
+        ----------
+        waveforms : Tensor
+            Generated waveforms of shape (batch_size, samples)
+        sample_rate : int
+            Sample rate of waveforms
+            
+        Returns
+        -------
+        Tensor
+            REINFORCE loss
+        """
+        if not self.use_rl_training or self._rl_log_probs is None:
+            raise ValueError("RL training not enabled or no log_probs available")
+        
+        if not self.use_hubert_classifier:
+            raise ValueError("HubERT classifier required for RL training")
+        
+        # Evaluate trustworthiness using HubERT
+        batch_size = waveforms.shape[0]
+        device = waveforms.device
+        
+        # Resample to 16 kHz if needed
+        if sample_rate != 16000:
+            import torchaudio
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=sample_rate,
+                new_freq=16000,
+            ).to(device)
+            waveforms = resampler(waveforms)
+        
+        # Create attention mask
+        seq_len = waveforms.shape[1]
+        attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
+        
+        # Get trustworthiness scores
+        with torch.no_grad():
+            trustworthiness_logits = self.hubert_classifier(
+                wav=waveforms,
+                mask=attention_mask,
+            )  # (batch_size, 1)
+        
+        # Compute rewards and advantages
+        rewards, advantages = self.reward_function.compute_reward(trustworthiness_logits)
+        
+        # REINFORCE loss: -log_prob * advantage
+        # We want to maximize reward, so minimize -log_prob * advantage
+        reinforce_loss = -(self._rl_log_probs * advantages.detach()).mean()
+        
+        # Entropy bonus for exploration
+        entropy_bonus = 0.0
+        if self._rl_entropy is not None:
+            entropy_bonus = -self.rl_entropy_coef * self._rl_entropy.mean()
+        
+        total_rl_loss = reinforce_loss + entropy_bonus
+        
+        # Log metrics
+        self.log(
+            "rl_reward_mean",
+            rewards.mean().detach(),
+            on_step=True,
+            on_epoch=True,
+        )
+        self.log(
+            "rl_advantage_mean",
+            advantages.mean().detach(),
+            on_step=True,
+            on_epoch=True,
+        )
+        if self._rl_entropy is not None:
+            self.log(
+                "rl_entropy_mean",
+                self._rl_entropy.mean().detach(),
+                on_step=True,
+                on_epoch=True,
+            )
+        
+        return total_rl_loss
 
     def on_validation_batch_end(self, outputs, batch, batch_idx, dataloader_idx=0):
         if batch_idx > 0:
@@ -196,9 +439,74 @@ class TTSModel(pl.LightningModule):
             mel_spectrogram=batch.mel_spectrogram,
             mel_spectrogram_len=batch.mel_spectrogram_len,
             max_len_override=self.max_len_override,
+            text=batch.text,
         )
 
         return mel_spectrogram, mel_spectrogram_post, gate, alignment, text
+    
+    def configure_optimizers(self):
+        """
+        Configure optimizers for TTS and RL training.
+        
+        Returns separate optimizers for:
+        1. TTS model (Tacotron2, GST, etc.)
+        2. RL policy network (if RL training is enabled)
+        """
+        from torch.optim import Adam
+        
+        # TTS optimizer (all parameters except RL policy)
+        tts_params = []
+        rl_params = []
+        
+        for name, param in self.named_parameters():
+            if 'rl_policy' in name:
+                rl_params.append(param)
+            else:
+                tts_params.append(param)
+        
+        optimizers = []
+        
+        # TTS optimizer
+        tts_optimizer = Adam(tts_params, lr=1e-3)
+        optimizers.append(tts_optimizer)
+        
+        # RL policy optimizer (if RL training is enabled)
+        if self.use_rl_training and len(rl_params) > 0:
+            rl_optimizer = Adam(rl_params, lr=1e-4)
+            optimizers.append(rl_optimizer)
+        
+        return optimizers[0] if len(optimizers) == 1 else optimizers
+    
+    def evaluate_trustworthiness(self, mel_spectrogram: Tensor, mel_len: Optional[Tensor] = None) -> Tensor:
+        """
+        Evaluate trustworthiness of generated mel spectrogram using HubERT.
+        
+        Note: HubERT expects waveform input, so this method should be called
+        after converting mel spectrogram to waveform using a vocoder.
+        
+        Parameters
+        ----------
+        mel_spectrogram : Tensor
+            Mel spectrogram of shape (batch, mel_channels, time)
+        mel_len : Optional[Tensor]
+            Lengths of mel spectrograms
+            
+        Returns
+        -------
+        Tensor
+            Trustworthiness scores of shape (batch, 1)
+        """
+        if not self.use_hubert_classifier:
+            raise ValueError("HubERT classifier is not enabled")
+        
+        # HubERT expects waveform input, not mel spectrogram
+        # This method should be called after vocoder conversion
+        # For now, return placeholder
+        # TODO: Integrate vocoder and convert mel -> waveform before HubERT evaluation
+        raise NotImplementedError(
+            "Trustworthiness evaluation requires waveform input. "
+            "Please convert mel spectrogram to waveform using a vocoder first."
+        )
 
 
 def plot_spectrogram_to_numpy(spectrogram) -> Figure:
