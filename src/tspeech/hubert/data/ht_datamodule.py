@@ -40,7 +40,7 @@ class HTDataModule(LightningDataModule):
         for dataset in self.datasets:
             dataset_train, dataset_val, dataset_test = random_split(
                 dataset,
-                [0.8, 0.1, 0.1],
+                [0.7, 0.1, 0.2],
                 generator=torch.Generator().manual_seed(42),
             )
 
