@@ -1,11 +1,9 @@
 from typing import List, Optional
+from pathlib import Path
 
 import lightning as pl
-import matplotlib
 import numpy as np
 import torch
-from matplotlib.figure import Figure
-from matplotlib import pyplot as plt
 from torch import Tensor
 from torch.nn import functional as F
 
@@ -44,6 +42,8 @@ class TTSModel(pl.LightningModule):
         rl_entropy_coef: float = 0.01,
         use_vocoder: bool = True,
         vocoder_model_name: str = "charactr/vocos-mel-24khz",
+        save_audio_dir: Optional[str] = None,
+        save_audio_every_n_steps: int = 100,
     ):
         super().__init__()
 
@@ -56,6 +56,12 @@ class TTSModel(pl.LightningModule):
         self.use_rl_training = use_rl_training
         self.rl_entropy_coef = rl_entropy_coef
         self.use_vocoder = use_vocoder
+        self.save_audio_dir = save_audio_dir
+        self.save_audio_every_n_steps = save_audio_every_n_steps
+        
+        # Create audio output directory if specified
+        if self.save_audio_dir:
+            Path(self.save_audio_dir).mkdir(parents=True, exist_ok=True)
         
         # Enable manual optimization when using multiple optimizers (RL training)
         if use_rl_training:
@@ -125,26 +131,15 @@ class TTSModel(pl.LightningModule):
         if use_hubert_classifier:
             from tspeech.hubert.model.htmodel import HTModel
             
-            # Load HubERT model (can be pretrained checkpoint or fresh)
-            if hubert_checkpoint_path:
-                # Load from checkpoint
-                self.hubert_classifier = HTModel.load_from_checkpoint(
-                    hubert_checkpoint_path,
-                    hubert_model_name=hubert_model_name,
-                    trainable_layers=0,  # Use frozen for inference
-                )
-                # Freeze for inference
-                for param in self.hubert_classifier.parameters():
-                    param.requires_grad = False
-            else:
-                # Create new model (will need to be trained separately)
-                self.hubert_classifier = HTModel(
-                    hubert_model_name=hubert_model_name,
-                    trainable_layers=0,
-                )
-                # Freeze for inference
-                for param in self.hubert_classifier.parameters():
-                    param.requires_grad = False
+            # Load from checkpoint
+            self.hubert_classifier = HTModel.load_from_checkpoint(
+                hubert_checkpoint_path,
+                hubert_model_name=hubert_model_name,
+                trainable_layers=0,  # Use frozen for inference
+            )
+            # Freeze for inference
+            for param in self.hubert_classifier.parameters():
+                param.requires_grad = False
 
     def forward(
         self,
@@ -192,6 +187,14 @@ class TTSModel(pl.LightningModule):
             style = style.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, encoded_dim)
         else:
             # Fallback to original mel-based GST
+            # Extract style embedding from reference audio mel spectrogram
+            # This style can be used with any text - the text determines WHAT is said,
+            # while the GST style determines HOW it's said (prosody, emotion, etc.)
+            if mel_spectrogram is None or mel_spectrogram_len is None:
+                raise ValueError(
+                    "mel_spectrogram and mel_spectrogram_len are required when use_bert_gst=False. "
+                    "These should be the mel spectrogram from the reference audio for GST style extraction."
+                )
             style = self.gst(mel_spectrogram, mel_spectrogram_len)  # (batch, encoded_dim)
             # Expand to match sequence length
             batch_size = chars_idx.shape[0]
@@ -200,32 +203,66 @@ class TTSModel(pl.LightningModule):
                 style = style.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, encoded_dim)
 
         # Forward through Tacotron2
+        # Note: When use_bert_gst=False, mel_spectrogram is used for GST style extraction (already done above).
+        # During inference (teacher_forcing=False), Tacotron2 doesn't use mel_spectrogram for teacher forcing,
+        # but we still pass it here (it's ignored by Tacotron2 when teacher_forcing=False).
+        # The text (chars_idx) determines WHAT is said, while the GST style (extracted from reference audio)
+        # determines HOW it's said (prosody, emotion, speaking style, etc.).
         mel_output, mel_postnet, gate, alignment = self.tacotron2(
             chars_idx=chars_idx,
             chars_idx_len=chars_idx_len,
             teacher_forcing=teacher_forcing,
-            mel_spectrogram=mel_spectrogram,
+            mel_spectrogram=mel_spectrogram,  # Used for GST style extraction (when use_bert_gst=False)
             mel_spectrogram_len=mel_spectrogram_len,
             speaker_id=speaker_id,
             max_len_override=max_len_override,
-            encoded_extra=style,
+            encoded_extra=style,  # GST style embedding (from reference audio when use_bert_gst=False)
         )
         
         # Evaluate trustworthiness with HubERT if requested
         trustworthiness_score = None
         if return_trustworthiness and self.use_hubert_classifier:
-            # Convert mel spectrogram to waveform for HubERT
-            # Note: This requires a vocoder. For now, we'll use mel directly
-            # In practice, you'd convert mel -> waveform using a vocoder (e.g., WaveGlow, HiFi-GAN)
-            # For HubERT, we need waveform input, but we can approximate or use mel features
-            
-            # HubERT expects waveform input, but we have mel spectrograms
-            # We'll need to convert mel -> waveform or adapt HubERT input
-            # For now, skip trustworthiness evaluation in forward pass
-            # It should be done separately after vocoder conversion
-            pass
+            try:
+                # Convert mel_postnet to waveform using vocoder
+                waveforms = self.vocoder(mel_postnet, sample_rate=22050)
+                
+                # Move waveforms to same device as model
+                waveforms = waveforms.to(self.device)
+                
+                # Resample to 16 kHz for HubERT if needed
+                if waveforms.shape[1] > 0:  # Check if waveform is not empty
+                    import torchaudio
+                    resampler = torchaudio.transforms.Resample(
+                        orig_freq=22050,
+                        new_freq=16000,
+                    ).to(self.device)
+                    waveforms_16k = resampler(waveforms)
+                    
+                    # Create attention mask
+                    batch_size = waveforms_16k.shape[0]
+                    seq_len = waveforms_16k.shape[1]
+                    attention_mask = torch.ones(
+                        batch_size, seq_len, dtype=torch.long, device=self.device
+                    )
+                    
+                    # Get trustworthiness scores from HubERT
+                    with torch.no_grad():
+                        trustworthiness_logits = self.hubert_classifier(
+                            wav=waveforms_16k,
+                            mask=attention_mask,
+                        )  # (batch_size, 1)
+                        
+                        # Convert logits to probability
+                        trustworthiness_score = torch.sigmoid(trustworthiness_logits).squeeze(-1)  # (batch_size,)
+            except Exception as e:
+                # If vocoder or HubERT evaluation fails, return None
+                print(f"⚠ Warning: Failed to compute trustworthiness score: {e}")
+                trustworthiness_score = None
         
-        return mel_output, mel_postnet, gate, alignment
+        if return_trustworthiness:
+            return mel_output, mel_postnet, gate, alignment, trustworthiness_score
+        else:
+            return mel_output, mel_postnet, gate, alignment
 
     def validation_step(self, batch: TTSBatch, batch_idx):
         mel_spectrogram, mel_spectrogram_post, gate, alignment = self(
@@ -282,44 +319,33 @@ class TTSModel(pl.LightningModule):
         
         tts_loss = gate_loss + mel_loss + mel_post_loss
         
-        # RL loss (REINFORCE) if RL training is enabled
+        # RL loss computation (only during RL training)
         rl_loss = None
-        if self.use_rl_training and self._rl_log_probs is not None:
-            if self.vocoder is not None:
-                # Full RL training with vocoder
-                try:
-                    # Convert mel_postnet to waveform
-                    # mel_postnet shape: (batch, time_frames, num_mels)
-                    waveforms = self.vocoder(mel_postnet, sample_rate=22050)
-                    
-                    # Compute RL loss using waveforms
-                    rl_loss = self.compute_rl_loss(waveforms, sample_rate=22050)
-                    
-                    # Log RL metrics
-                    if batch_idx % 10 == 0:  # Log more frequently
-                        self.log("rl_training_active", 1.0, on_step=True)
-                        self.log("vocoder_used", 1.0, on_step=True)
-                except Exception as e:
-                    # Fallback to placeholder if vocoder fails
-                    print(f"⚠ Vocoder error in batch {batch_idx}: {e}")
-                    rl_loss = torch.tensor(0.0, device=tts_loss.device, requires_grad=True)
-                    if batch_idx % 100 == 0:
-                        self.log("rl_training_active", 1.0, on_step=True)
-                        self.log("vocoder_error", 1.0, on_step=True)
-            else:
-                # Placeholder RL loss (vocoder not available)
-                rl_loss = torch.tensor(0.0, device=tts_loss.device, requires_grad=True)
-                if batch_idx % 100 == 0:
-                    self.log("rl_training_active", 1.0, on_step=True)
-                    self.log("vocoder_missing", 1.0, on_step=True)
+            # Full RL training with vocoder
+        try:
+            # Convert mel spectrogram to waveform
+            waveforms = self.vocoder(mel_spectrogram_post, sample_rate=22050)
+            
+            # Save audio files periodically
+            self._save_audio_if_needed(waveforms, batch_idx)
+            
+            # Compute RL loss from waveforms
+            rl_loss = self.compute_rl_loss(waveforms, sample_rate=22050)
+            
+            # Log success
+            if batch_idx % 10 == 0:
+                self.log("rl_training_active", 1.0, on_step=True)
+                self.log("vocoder_used", 1.0, on_step=True)
+        except Exception as e:
+            # Fallback on error
+            print(f"⚠ Vocoder/RL error in batch {batch_idx}: {e}")
+            rl_loss = torch.tensor(0.0, device=tts_loss.device, requires_grad=True)
         
         # Total loss
-        if rl_loss is not None:
-            loss = tts_loss + rl_loss
-        else:
-            loss = tts_loss
+        loss = tts_loss + rl_loss
 
         # Manual optimization when using multiple optimizers (RL training)
+        # PyTorch Lightning requires manual optimization when using multiple optimizers
         if self.automatic_optimization == False:
             optimizers = self.optimizers()
             if isinstance(optimizers, (list, tuple)) and len(optimizers) > 1:
@@ -342,66 +368,42 @@ class TTSModel(pl.LightningModule):
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
-            
-            # Log metrics and return dict for Lightning (still needed for logging)
-            self.log(
-                "training_gate_loss",
-                gate_loss.detach(),
-                on_step=True,
-                on_epoch=True,
-            )
-            self.log("training_mel_loss", mel_loss.detach(), on_step=True, on_epoch=True)
-            self.log(
-                "training_mel_post_loss",
-                mel_post_loss.detach(),
-                on_step=True,
-                on_epoch=True,
-            )
-            if rl_loss is not None:
-                self.log(
-                    "training_rl_loss",
-                    rl_loss.detach(),
-                    on_step=True,
-                    on_epoch=True,
-                )
-            self.log(
-                "training_loss",
-                loss.detach(),
-                on_step=True,
-                on_epoch=True,
-            )
-            
-            # Return dict for logging (loss is already handled manually)
-            return {"loss": loss.detach()}
-
-        self.log(
-            "training_gate_loss",
-            gate_loss.detach(),
-            on_step=True,
-            on_epoch=True,
-        )
+        
+        # Log metrics (same for both manual and automatic optimization)
+        self._log_training_metrics(gate_loss, mel_loss, mel_post_loss, rl_loss, loss)
+        
+        return loss if self.automatic_optimization else {"loss": loss.detach()}
+    
+    def _log_training_metrics(self, gate_loss, mel_loss, mel_post_loss, rl_loss, total_loss):
+        """Log training metrics (shared between manual and automatic optimization)."""
+        self.log("training_gate_loss", gate_loss.detach(), on_step=True, on_epoch=True)
         self.log("training_mel_loss", mel_loss.detach(), on_step=True, on_epoch=True)
-        self.log(
-            "training_mel_post_loss",
-            mel_post_loss.detach(),
-            on_step=True,
-            on_epoch=True,
-        )
+        self.log("training_mel_post_loss", mel_post_loss.detach(), on_step=True, on_epoch=True)
         if rl_loss is not None:
-            self.log(
-                "training_rl_loss",
-                rl_loss.detach(),
-                on_step=True,
-                on_epoch=True,
-            )
-        self.log(
-            "training_loss",
-            loss.detach(),
-            on_step=True,
-            on_epoch=True,
-        )
-
-        return loss
+            self.log("training_rl_loss", rl_loss.detach(), on_step=True, on_epoch=True)
+        self.log("training_loss", total_loss.detach(), on_step=True, on_epoch=True)
+    
+    def _save_audio_if_needed(self, waveforms: Tensor, batch_idx: int):
+        """Save audio files periodically if audio saving is enabled."""
+        if not (self.save_audio_dir and batch_idx % self.save_audio_every_n_steps == 0):
+            return
+        
+        try:
+            import soundfile as sf
+            import numpy as np
+            
+            for i, waveform in enumerate(waveforms):
+                audio_np = waveform.detach().cpu().numpy()
+                # Normalize to [-1, 1]
+                max_val = np.abs(audio_np).max()
+                if max_val > 0:
+                    audio_np = audio_np / (max_val + 1e-8)
+                
+                # Save audio file
+                audio_path = Path(self.save_audio_dir) / f"epoch_{self.current_epoch}_step_{batch_idx}_sample_{i}.wav"
+                sf.write(str(audio_path), audio_np, 22050)
+        except Exception as e:
+            print(f"⚠ Warning: Failed to save audio: {e}")
     
     def compute_rl_loss(
         self,
@@ -428,12 +430,6 @@ class TTSModel(pl.LightningModule):
         Tensor
             REINFORCE loss
         """
-        if not self.use_rl_training or self._rl_log_probs is None:
-            raise ValueError("RL training not enabled or no log_probs available")
-        
-        if not self.use_hubert_classifier:
-            raise ValueError("HubERT classifier required for RL training")
-        
         # Evaluate trustworthiness using HubERT
         batch_size = waveforms.shape[0]
         device = waveforms.device
@@ -494,39 +490,6 @@ class TTSModel(pl.LightningModule):
             )
         
         return total_rl_loss
-
-    def on_validation_batch_end(self, outputs, batch, batch_idx, dataloader_idx=0):
-        if batch_idx > 0:
-            return
-
-        with matplotlib.rc_context({"backend": "Agg"}):
-            self.logger.experiment.add_figure(
-                "val_mel_spectrogram",
-                plot_spectrogram_to_numpy(outputs["mel_spectrogram"].cpu().T.numpy()),
-                self.global_step,
-            )
-            self.logger.experiment.add_figure(
-                "val_mel_spectrogram_predicted",
-                plot_spectrogram_to_numpy(
-                    outputs["mel_spectrogram_pred"].cpu().swapaxes(0, 1).numpy()
-                ),
-                self.global_step,
-            )
-            self.logger.experiment.add_figure(
-                "val_alignment",
-                plot_alignment_to_numpy(
-                    outputs["alignment"].cpu().swapaxes(0, 1).numpy()
-                ),
-                self.global_step,
-            )
-            self.logger.experiment.add_figure(
-                "val_gate",
-                plot_gate_outputs_to_numpy(
-                    outputs["gate"].cpu().squeeze().numpy(),
-                    torch.sigmoid(outputs["gate_pred"]).squeeze().cpu().numpy(),
-                ),
-                self.global_step,
-            )
 
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
         text = batch.text
@@ -607,55 +570,3 @@ class TTSModel(pl.LightningModule):
             "Trustworthiness evaluation requires waveform input. "
             "Please convert mel spectrogram to waveform using a vocoder first."
         )
-
-
-def plot_spectrogram_to_numpy(spectrogram) -> Figure:
-    fig, ax = plt.subplots(figsize=(12, 3))
-    im = ax.imshow(spectrogram, aspect="auto", origin="lower")
-    fig.colorbar(im, ax=ax)
-    ax.set_xlabel("Frames")
-    ax.set_ylabel("Channels")
-    fig.tight_layout()
-
-    return fig
-
-
-def plot_alignment_to_numpy(alignment, info=None) -> Figure:
-    fig, ax = plt.subplots(figsize=(6, 4))
-    im = ax.imshow(alignment, aspect="auto", origin="lower", interpolation="none")
-    fig.colorbar(im, ax=ax)
-    xlabel = "Decoder timestep"
-    if info is not None:
-        xlabel += "\n\n" + info
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Encoder timestep")
-    fig.tight_layout()
-    return fig
-
-
-def plot_gate_outputs_to_numpy(gate_targets, gate_outputs) -> Figure:
-    fig, ax = plt.subplots(figsize=(12, 3))
-    ax.scatter(
-        range(len(gate_targets)),
-        gate_targets,
-        alpha=0.5,
-        color="green",
-        marker="+",
-        s=1,
-        label="target",
-    )
-    ax.scatter(
-        range(len(gate_outputs)),
-        gate_outputs,
-        alpha=0.5,
-        color="red",
-        marker=".",
-        s=1,
-        label="predicted",
-    )
-
-    ax.set_xlabel("Frames (Green target, Red predicted)")
-    ax.set_ylabel("Gate State")
-    fig.tight_layout()
-
-    return fig

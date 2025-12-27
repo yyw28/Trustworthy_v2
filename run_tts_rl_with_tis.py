@@ -2,16 +2,33 @@
 """
 Train TTS model with RL using TIS dataset.
 
-This script:
-1. Converts TIS data to TTS format (if needed)
-2. Trains TTS model with RL using TIS audio files
+This script performs two main steps:
+
+STEP 1: Prepare TTS training data
+    - Extracts text transcripts from TIS audio files
+      * Option A: Use Whisper ASR to extract real transcripts (--use_asr)
+      * Option B: Use placeholder text (faster, for testing)
+    - Creates CSV files: train.csv, val.csv, test.csv
+    - Format: wav_path|transcript_text|speaker_id
+    - Skips this step if CSV files already exist
+
+STEP 2: Train TTS model with Reinforcement Learning
+    - Trains Tacotron2 TTS model
+    - Uses RL policy to optimize GST weights for trustworthiness
+    - Uses HuBERT classifier to provide trustworthiness rewards
 
 Usage:
+    # With ASR (extract real transcripts):
     python run_tts_rl_with_tis.py \
         --tis_dir /path/to/tis \
         --hubert_checkpoint /path/to/hubert/checkpoint.ckpt \
-        [--use_asr] \
-        [--placeholder_text "Your text here"]
+        --use_asr
+    
+    # With placeholder text (faster, for testing):
+    python run_tts_rl_with_tis.py \
+        --tis_dir /path/to/tis \
+        --hubert_checkpoint /path/to/hubert/checkpoint.ckpt \
+        --placeholder_text "This is a trustworthy statement."
 """
 
 import argparse
@@ -41,27 +58,43 @@ def main():
     parser.add_argument("--accelerator", type=str, default="gpu", choices=["gpu", "cpu", "mps"])
     parser.add_argument("--devices", type=int, default=1, help="Number of devices")
     
-    # Output directory for TTS CSV files
+    # Output directory for TTS CSV files (contains train.csv, val.csv, test.csv)
     parser.add_argument("--tts_csv_dir", type=str, default="./tis_tts_data", help="Directory for TTS CSV files")
+    
+    # Audio saving arguments
+    parser.add_argument("--save_audio_dir", type=str, default=None, help="Directory to save generated audio files during training (optional)")
+    parser.add_argument("--save_audio_every_n_steps", type=int, default=100, help="Save audio every N training steps (default: 100)")
     
     args = parser.parse_args()
     
+    # ============================================================================
+    # STEP 1: Prepare TTS training data (extract transcripts and create CSV files)
+    # ============================================================================
+    # This step converts TIS audio files into TTS training format:
+    # - Extracts text transcripts (using ASR or placeholder text)
+    # - Creates CSV files: train.csv, val.csv, test.csv
+    # - Format: wav_path|transcript_text|speaker_id
+    # ============================================================================
+    
     tis_dir = Path(args.tis_dir)
     tts_csv_dir = Path(args.tts_csv_dir)
-    
-    # Step 1: Check if TTS CSV files exist, if not create them
     train_csv = tts_csv_dir / "train.csv"
     val_csv = tts_csv_dir / "val.csv"
     
+    # Check if CSV files already exist (skip if already prepared)
     if not train_csv.exists() or not val_csv.exists():
         print("=" * 80)
-        print("Step 1: Converting TIS data to TTS format")
+        print("STEP 1: Preparing TTS training data")
         print("=" * 80)
+        print("Extracting transcripts and creating CSV files...")
+        print()
         
+        # Find the data preparation script
         prepare_script = Path(__file__).parent / "prepare_tis_for_tts.py"
         if not prepare_script.exists():
             raise FileNotFoundError(f"prepare_tis_for_tts.py not found: {prepare_script}")
         
+        # Build command to run the preparation script
         cmd = [
             sys.executable,
             str(prepare_script),
@@ -69,25 +102,52 @@ def main():
             "--output_dir", str(tts_csv_dir),
         ]
         
+        # Add transcript extraction method:
+        # Option A: Use Whisper ASR to extract real transcripts from audio
         if args.use_asr:
             cmd.append("--use_asr")
-        
-        if args.placeholder_text:
+            print("  Using Whisper ASR to extract transcripts from audio files")
+        # Option B: Use placeholder text (faster, for testing)
+        else:
             cmd.extend(["--placeholder_text", args.placeholder_text])
+            print(f"  Using placeholder text: '{args.placeholder_text}'")
         
-        print(f"Running: {' '.join(cmd)}")
+        print(f"\nRunning: {' '.join(cmd)}")
+        print()
+        
+        # Run the preparation script
         result = subprocess.run(cmd, check=True)
         
+        # Verify CSV files were created successfully
         if not train_csv.exists() or not val_csv.exists():
-            raise RuntimeError(f"Failed to create TTS CSV files in {tts_csv_dir}")
+            raise RuntimeError(
+                f"Failed to create TTS CSV files in {tts_csv_dir}\n"
+                f"Expected files: {train_csv}, {val_csv}"
+            )
         
-        print("✓ TTS CSV files created")
+        print("\n✓ TTS CSV files created successfully")
+        print(f"  - Training data: {train_csv}")
+        print(f"  - Validation data: {val_csv}")
     else:
-        print(f"✓ Using existing TTS CSV files in {tts_csv_dir}")
+        print("=" * 80)
+        print("STEP 1: Using existing TTS training data")
+        print("=" * 80)
+        print(f"✓ Found existing CSV files in {tts_csv_dir}")
+        print(f"  - Training data: {train_csv}")
+        print(f"  - Validation data: {val_csv}")
+        print("  (Skipping data preparation step)")
     
-    # Step 2: Train TTS with RL
+    # ============================================================================
+    # STEP 2: Train TTS model with Reinforcement Learning
+    # ============================================================================
+    # This step trains the TTS model using:
+    # - Tacotron2 for mel spectrogram generation
+    # - RL policy to optimize GST weights for trustworthiness
+    # - HuBERT classifier to provide trustworthiness rewards
+    # ============================================================================
+    
     print("\n" + "=" * 80)
-    print("Step 2: Training TTS model with RL")
+    print("STEP 2: Training TTS model with Reinforcement Learning")
     print("=" * 80)
     
     run_tts_script = Path(__file__).parent / "run_tts_with_rl.py"
@@ -110,6 +170,12 @@ def main():
         "--accelerator", args.accelerator,
         "--devices", str(args.devices),
     ]
+    
+    # Add audio saving arguments if specified
+    if args.save_audio_dir:
+        cmd.extend(["--save_audio_dir", args.save_audio_dir])
+        cmd.extend(["--save_audio_every_n_steps", str(args.save_audio_every_n_steps)])
+        print(f"  Audio saving enabled: {args.save_audio_dir} (every {args.save_audio_every_n_steps} steps)")
     
     print(f"Running: {' '.join(cmd)}")
     print("\n" + "=" * 80)
