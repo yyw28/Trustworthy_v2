@@ -42,6 +42,8 @@ class TTSModel(pl.LightningModule):
         use_rl_training: bool = False,
         rl_temperature: float = 1.0,
         rl_entropy_coef: float = 0.01,
+        use_vocoder: bool = True,
+        vocoder_model_name: str = "charactr/vocos-mel-24khz",
     ):
         super().__init__()
 
@@ -53,6 +55,28 @@ class TTSModel(pl.LightningModule):
         self.use_hubert_classifier = use_hubert_classifier
         self.use_rl_training = use_rl_training
         self.rl_entropy_coef = rl_entropy_coef
+        self.use_vocoder = use_vocoder
+        
+        # Enable manual optimization when using multiple optimizers (RL training)
+        if use_rl_training:
+            self.automatic_optimization = False
+        
+        # Initialize vocoder for RL training
+        self.vocoder = None
+        if use_rl_training and use_vocoder:
+            try:
+                from tspeech.vocoder import VocosVocoder
+                # Use CPU for vocoder (MPS has limitations with some operations)
+                self.vocoder = VocosVocoder(
+                    model_name=vocoder_model_name,
+                    sample_rate=22050,  # Match TTS sample rate
+                    device="cpu",  # Use CPU for compatibility
+                )
+                print("✓ Vocoder initialized for RL training (CPU mode)")
+            except Exception as e:
+                print(f"⚠ Warning: Could not initialize vocoder: {e}")
+                print("  RL training will use placeholder loss")
+                self.vocoder = None
 
         self.tacotron2 = Tacotron2(
             num_chars=num_chars,
@@ -261,20 +285,94 @@ class TTSModel(pl.LightningModule):
         # RL loss (REINFORCE) if RL training is enabled
         rl_loss = None
         if self.use_rl_training and self._rl_log_probs is not None:
-            # Note: For RL training, we need to:
-            # 1. Generate waveform from mel spectrogram (requires vocoder)
-            # 2. Evaluate trustworthiness using HubERT
-            # 3. Compute REINFORCE loss
-            
-            # For now, we'll compute RL loss in a separate step after vocoder conversion
-            # This is a placeholder - in practice, you'd call this after vocoder
-            rl_loss = torch.tensor(0.0, device=tts_loss.device, requires_grad=True)
+            if self.vocoder is not None:
+                # Full RL training with vocoder
+                try:
+                    # Convert mel_postnet to waveform
+                    # mel_postnet shape: (batch, time_frames, num_mels)
+                    waveforms = self.vocoder(mel_postnet, sample_rate=22050)
+                    
+                    # Compute RL loss using waveforms
+                    rl_loss = self.compute_rl_loss(waveforms, sample_rate=22050)
+                    
+                    # Log RL metrics
+                    if batch_idx % 10 == 0:  # Log more frequently
+                        self.log("rl_training_active", 1.0, on_step=True)
+                        self.log("vocoder_used", 1.0, on_step=True)
+                except Exception as e:
+                    # Fallback to placeholder if vocoder fails
+                    print(f"⚠ Vocoder error in batch {batch_idx}: {e}")
+                    rl_loss = torch.tensor(0.0, device=tts_loss.device, requires_grad=True)
+                    if batch_idx % 100 == 0:
+                        self.log("rl_training_active", 1.0, on_step=True)
+                        self.log("vocoder_error", 1.0, on_step=True)
+            else:
+                # Placeholder RL loss (vocoder not available)
+                rl_loss = torch.tensor(0.0, device=tts_loss.device, requires_grad=True)
+                if batch_idx % 100 == 0:
+                    self.log("rl_training_active", 1.0, on_step=True)
+                    self.log("vocoder_missing", 1.0, on_step=True)
         
         # Total loss
         if rl_loss is not None:
             loss = tts_loss + rl_loss
         else:
             loss = tts_loss
+
+        # Manual optimization when using multiple optimizers (RL training)
+        if self.automatic_optimization == False:
+            optimizers = self.optimizers()
+            if isinstance(optimizers, (list, tuple)) and len(optimizers) > 1:
+                # Multiple optimizers: TTS and RL
+                tts_opt, rl_opt = optimizers
+                
+                # TTS optimizer step
+                tts_opt.zero_grad()
+                tts_loss.backward(retain_graph=rl_loss is not None)
+                tts_opt.step()
+                
+                # RL optimizer step (if RL loss exists)
+                if rl_loss is not None:
+                    rl_opt.zero_grad()
+                    rl_loss.backward()
+                    rl_opt.step()
+            else:
+                # Single optimizer (fallback)
+                opt = optimizers[0] if isinstance(optimizers, (list, tuple)) else optimizers
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+            
+            # Log metrics and return dict for Lightning (still needed for logging)
+            self.log(
+                "training_gate_loss",
+                gate_loss.detach(),
+                on_step=True,
+                on_epoch=True,
+            )
+            self.log("training_mel_loss", mel_loss.detach(), on_step=True, on_epoch=True)
+            self.log(
+                "training_mel_post_loss",
+                mel_post_loss.detach(),
+                on_step=True,
+                on_epoch=True,
+            )
+            if rl_loss is not None:
+                self.log(
+                    "training_rl_loss",
+                    rl_loss.detach(),
+                    on_step=True,
+                    on_epoch=True,
+                )
+            self.log(
+                "training_loss",
+                loss.detach(),
+                on_step=True,
+                on_epoch=True,
+            )
+            
+            # Return dict for logging (loss is already handled manually)
+            return {"loss": loss.detach()}
 
         self.log(
             "training_gate_loss",
@@ -310,6 +408,8 @@ class TTSModel(pl.LightningModule):
         waveforms: Tensor,
         sample_rate: int = 16000,
     ) -> Tensor:
+        # Move waveforms to same device as model
+        waveforms = waveforms.to(self.device)
         """
         Compute REINFORCE loss for RL training.
         

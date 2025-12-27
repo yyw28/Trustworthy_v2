@@ -125,8 +125,13 @@ class TTSDatamodule(LightningDataModule):
         )
 
     def __load_dataset(self, filename: str) -> TTSDataset:
+        # Handle absolute paths
+        if path.isabs(filename):
+            csv_path = filename
+        else:
+            csv_path = path.join(self.dataset_dir, filename)
         df = pd.read_csv(
-            path.join(self.dataset_dir, filename), delimiter="|", quoting=csv.QUOTE_NONE
+            csv_path, delimiter="|", quoting=csv.QUOTE_NONE, header=None, names=['wav', 'text', 'speaker_idx']
         )
 
         return TTSDataset(

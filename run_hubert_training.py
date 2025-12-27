@@ -168,16 +168,20 @@ def main():
         print(f"Using multi-GPU strategy: {strategy}")
     
     # Initialize trainer
-    trainer = pl.Trainer(
-        accelerator=args.accelerator,
-        devices=args.devices if args.accelerator != "cpu" else "auto",
-        strategy=strategy,
-        precision="16-mixed" if args.accelerator != "cpu" else "32-true",  # CPU doesn't support 16-mixed
-        max_epochs=args.max_epochs,
-        accumulate_grad_batches=2,
-        logger=logger,
-        callbacks=callbacks,
-    )
+    trainer_kwargs = {
+        "accelerator": args.accelerator,
+        "devices": args.devices if args.accelerator != "cpu" else "auto",
+        "precision": "16-mixed" if args.accelerator != "cpu" else "32-true",  # CPU doesn't support 16-mixed
+        "max_epochs": args.max_epochs,
+        "accumulate_grad_batches": 2,
+        "logger": logger,
+        "callbacks": callbacks,
+    }
+    # Only add strategy if it's not None
+    if strategy is not None:
+        trainer_kwargs["strategy"] = strategy
+    
+    trainer = pl.Trainer(**trainer_kwargs)
     
     # Train
     print("\n" + "=" * 60)
