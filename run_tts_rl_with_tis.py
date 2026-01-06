@@ -48,6 +48,9 @@ def main():
     # HuBERT checkpoint
     parser.add_argument("--hubert_checkpoint", type=str, required=True, help="Path to trained HuBERT checkpoint")
     
+    # TTS checkpoint (pre-trained Tacotron2 + GST)
+    parser.add_argument("--tts_checkpoint", type=str, default=None, help="Path to pre-trained Tacotron2 + GST checkpoint (optional)")
+    
     # TTS training arguments (passed to run_tts_with_rl.py)
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of data loader workers")
@@ -170,6 +173,11 @@ def main():
         "--accelerator", args.accelerator,
         "--devices", str(args.devices),
     ]
+    
+    # Add TTS checkpoint if provided
+    if args.tts_checkpoint:
+        cmd.extend(["--tts_checkpoint", args.tts_checkpoint])
+        print(f"  TTS checkpoint: {args.tts_checkpoint}")
     
     # Add audio saving arguments if specified
     if args.save_audio_dir:
